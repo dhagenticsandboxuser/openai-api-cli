@@ -11,9 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -21,11 +19,9 @@ import (
 	"github.com/openai/openai-go/v3/responses"
 )
 
-// main cancels an active request on interrupt and keeps diagnostics off stdout.
+// main keeps diagnostics off stdout and leaves signals to the default handler.
 func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-	if err := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
+	if err := run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "openai-api-cli:", err)
 		os.Exit(1)
 	}
