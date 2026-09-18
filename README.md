@@ -63,3 +63,29 @@ Tests use local HTTP servers and dummy credentials to check requests, SSE framin
 streamed output, and failure handling. They do not contact OpenAI or incur charges.
 A live API smoke test requires your own valid credentials and incurs normal API
 usage charges; it has not been performed as part of this implementation.
+
+## Detailed logging
+
+Use `-verbose` to write timestamped JSON-lines logs to stderr, or
+`-log-file /path/to/trace.jsonl` to enable logging to a file instead:
+
+```sh
+./openai-api-cli -model YOUR_MODEL_ID -credentials /path/to/api-key.txt \
+  -prompt-file prompt.txt -log-file trace.jsonl > result.txt
+```
+
+Logging includes configuration validation, credential format (never its contents),
+prompt loading, parameter JSON parsing and overrides, outgoing request metadata
+and body chunks, incoming status/headers/body chunks, SSE lines and frame boundaries,
+SDK event decoding and dispatch, output writes, completion, and errors. Each record
+has a timestamp, sequence number, and step name. Body records contain readable
+`text` and `bytes_base64` for inspecting arbitrary bytes. Chunks reflect actual
+reads, not guaranteed event boundaries. Parsing traces observe SDK input and decoded
+events; the SDK still owns SSE/JSON parsing, so its internal per-field operations
+are not traced. Logging does not read ahead or wait for the full response.
+
+Logging is off by default and never goes to stdout. Authentication/cookie headers
+are redacted, along with occurrences of the supplied API key within individual
+records. Prompts, instructions, parameters, and generated output remain visible.
+New log files use permissions 0600; existing files are appended with their existing
+permissions. A logging write failure makes the command exit nonzero.

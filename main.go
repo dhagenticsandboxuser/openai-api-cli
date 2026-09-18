@@ -33,7 +33,7 @@ func main() {
 
 // run parses all configuration from flags, loads credentials and the prompt,
 // then makes exactly one streaming prediction request (no automatic retries).
-func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (result error) {
 	fs := flag.NewFlagSet("openai-api-cli", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	model := fs.String("model", "", "Required model ID")
@@ -46,12 +46,40 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	maxTokens := fs.Int("max-output-tokens", 0, "Output token limit; 0 uses the API default")
 	timeout := fs.Duration("timeout", 0, "Total request timeout, e.g. 2m; 0 waits until termination")
 	paramsFile := fs.String("params-file", "", "Optional JSON object of additional Responses API parameters")
+	verbose := fs.Bool("verbose", false, "Log HTTP traffic and parsing steps as JSON lines to stderr")
+	logFile := fs.String("log-file", "", "Write verbose JSON-lines logs to this file (enables logging)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		return err
 	}
+	log := &traceLogger{}
+	if *verbose {
+		log.writer = stderr
+	}
+	if *logFile != "" {
+		file, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return fmt.Errorf("open trace log: %w", err)
+		}
+		log.writer = file
+		defer func() {
+			if err := file.Close(); err != nil {
+				result = errors.Join(result, fmt.Errorf("close trace log: %w", err))
+			}
+		}()
+	}
+	defer func() {
+		fields := map[string]any{"success": result == nil}
+		if result != nil {
+			fields["error"] = result.Error()
+		}
+		log.record("run.end", fields)
+		result = errors.Join(result, log.failure())
+	}()
+	log.record("flags.parsed", map[string]any{"model": *model, "credentials_path": *credentials, "prompt_file": *promptFile, "endpoint": *endpoint, "params_file": *paramsFile, "timeout": timeout.String(), "max_output_tokens": *maxTokens})
+	log.record("configuration.validate", nil)
 	if fs.NArg() != 0 {
 		return errors.New("unexpected positional arguments")
 	}
@@ -65,11 +93,13 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil {
 		return errors.New("-endpoint must be an HTTP(S) URL without user credentials")
 	}
+	log.record("credentials.read", map[string]any{"path": *credentials})
 	keyBytes, err := os.ReadFile(*credentials)
 	if err != nil {
 		return fmt.Errorf("read credentials: %w", err)
 	}
 	key := strings.TrimSpace(string(keyBytes))
+	log.record("credentials.parse", map[string]any{"format": map[bool]string{true: "json", false: "plain"}[strings.HasPrefix(key, "{")]})
 	if strings.HasPrefix(key, "{") {
 		var c struct {
 			APIKey string `json:"api_key"`
@@ -82,6 +112,9 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if key == "" || strings.ContainsAny(key, "\r\n") {
 		return errors.New("credentials must contain one nonempty API key")
 	}
+	log.key = key
+	log.record("credentials.validated", nil)
+	log.record("prompt.read", map[string]any{"source": *promptFile})
 	var prompt []byte
 	if *promptFile == "-" {
 		prompt, err = io.ReadAll(stdin)
@@ -94,6 +127,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if strings.TrimSpace(string(prompt)) == "" {
 		return errors.New("prompt is empty")
 	}
+	log.record("prompt.validated", map[string]any{"size": len(prompt)})
 	// Additional parameters permit testing options beyond the dedicated CLI flags.
 	params := make(map[string]any)
 	if *paramsFile != "" {
@@ -101,6 +135,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		if err != nil {
 			return fmt.Errorf("read parameters: %w", err)
 		}
+		log.record("parameters.parse", log.bodyFields(b))
 		if json.Unmarshal(b, &params) != nil || params == nil {
 			return errors.New("parameters must be a JSON object")
 		}
@@ -116,6 +151,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if *maxTokens > 0 {
 		params["max_output_tokens"] = *maxTokens
 	}
+	encodedParams, _ := json.Marshal(params)
+	log.record("parameters.resolved", log.bodyFields(encodedParams))
 	// A context deadline covers the entire stream; SDK retries are explicitly disabled.
 	if *timeout > 0 {
 		var cancel context.CancelFunc
@@ -134,7 +171,23 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		option.WithMiddleware(func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
 			endpointURL := *u
 			req.URL = &endpointURL
-			return next(req)
+			if log.writer != nil {
+				log.record("request.send", map[string]any{"method": req.Method, "url": req.URL.String(), "headers": headers(req.Header)})
+				if req.Body != nil {
+					req.Body = &traceBody{ReadCloser: req.Body, log: log, direction: "request"}
+				}
+			}
+			resp, err := next(req)
+			if err != nil {
+				log.record("request.error", map[string]any{"error": err.Error()})
+			}
+			if resp != nil && log.writer != nil {
+				log.record("response.receive", map[string]any{"status": resp.StatusCode, "headers": headers(resp.Header)})
+				if resp.Body != nil {
+					resp.Body = &traceBody{ReadCloser: resp.Body, log: log, direction: "response"}
+				}
+			}
+			return resp, err
 		}),
 	)
 	request := responses.ResponseNewParams{
@@ -146,22 +199,34 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	for name, value := range params {
 		opts = append(opts, option.WithJSONSet(name, value))
 	}
+	log.record("sdk.stream.open", nil)
 	events := service.NewStreaming(ctx, request, opts...)
 	defer events.Close()
-	return stream(events, stdout)
+	return stream(events, stdout, log)
 }
 
 // stream consumes SDK-decoded events and writes text/refusal deltas immediately.
 // EOF alone is an interrupted prediction, not successful completion.
-func stream(events *ssestream.Stream[responses.ResponseStreamEventUnion], w io.Writer) error {
-	for events.Next() {
+func stream(events *ssestream.Stream[responses.ResponseStreamEventUnion], w io.Writer, logs ...*traceLogger) error {
+	var log *traceLogger
+	if len(logs) > 0 {
+		log = logs[0]
+	}
+	for {
+		log.record("parse.event.next", nil)
+		if !events.Next() {
+			break
+		}
 		event := events.Current()
+		log.record("parse.event.decoded", map[string]any{"type": event.Type, "sequence_number": event.SequenceNumber})
 		switch event.Type {
 		case "response.output_text.delta", "response.refusal.delta":
+			log.record("output.write", map[string]any{"size": len(event.Delta)})
 			if _, err := io.WriteString(w, event.Delta); err != nil {
 				return fmt.Errorf("write output: %w", err)
 			}
 		case "response.completed":
+			log.record("parse.event.completed", nil)
 			return nil
 		case "response.failed", "response.incomplete", "response.cancelled", "error":
 			detail := event.Message
@@ -171,9 +236,13 @@ func stream(events *ssestream.Stream[responses.ResponseStreamEventUnion], w io.W
 			if event.Response.IncompleteDetails.Reason != "" {
 				detail = string(event.Response.IncompleteDetails.Reason)
 			}
+			log.record("parse.event.failure", map[string]any{"type": event.Type, "detail": detail})
 			return fmt.Errorf("%s: %s", event.Type, detail)
+		default:
+			log.record("parse.event.ignored", map[string]any{"type": event.Type})
 		}
 	}
+	log.record("parse.event.end", nil)
 	if err := events.Err(); err != nil {
 		return fmt.Errorf("stream: %w", err)
 	}
