@@ -3,12 +3,12 @@
 A basic testing tool written in Go for direct text predictions with the
 [OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create).
 It sends one prompt and streams generated text (including refusal text) to stdout
-until the API terminates the response. It uses only the Go standard library.
+until the API terminates the response. It uses the official OpenAI Go SDK for requests, streaming, and API errors.
 This is a small testing utility, with no chat history, tool execution, or retries.
 
 ## Build and run
 
-Requires Go 1.22 or later.
+Requires Go 1.25 or later (required by the pinned SDK version).
 
 ```sh
 go build -o openai-api-cli .
