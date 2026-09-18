@@ -47,8 +47,8 @@ deltas are printed; other events are consumed but not displayed.
 Output is written immediately without an added newline. Diagnostics go to stderr.
 Successful completion exits 0. API failure, incomplete output (including reaching
 an output token limit), unexpected disconnects, output errors, or interruption
-exit nonzero; partial output may already have been printed. Ctrl-C cancels the
-request. There are no automatic continuation requests after termination. The
+exit nonzero; partial output may already have been printed. Signals use the default process behavior, so Ctrl-C terminates the process even
+while it is reading a prompt from stdin. There are no automatic continuation requests after termination. The
 endpoint flag supports local mock servers; real credentials should be sent only
 to a trusted HTTPS endpoint. Redirects are refused.
 
