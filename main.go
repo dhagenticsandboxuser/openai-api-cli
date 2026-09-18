@@ -2,8 +2,6 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,7 +14,11 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
+
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/ssestream"
+	"github.com/openai/openai-go/v3/responses"
 )
 
 // main cancels an active request on interrupt and keeps diagnostics off stdout.
@@ -92,7 +94,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if strings.TrimSpace(string(prompt)) == "" {
 		return errors.New("prompt is empty")
 	}
-	// Additional parameters permit testing API options without adding dependencies.
+	// Additional parameters permit testing options beyond the dedicated CLI flags.
 	params := make(map[string]any)
 	if *paramsFile != "" {
 		b, err := os.ReadFile(*paramsFile)
@@ -114,105 +116,66 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if *maxTokens > 0 {
 		params["max_output_tokens"] = *maxTokens
 	}
-	body, err := json.Marshal(params)
-	if err != nil {
-		return fmt.Errorf("encode request: %w", err)
+	// A context deadline covers the entire stream; SDK retries are explicitly disabled.
+	if *timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *timeout)
+		defer cancel()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, *endpoint, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+	// The SDK Responses service avoids inheriting environment settings. Retain the
+	// full endpoint flag with middleware, since the SDK normally appends /responses.
+	service := responses.NewResponseService(
+		option.WithAPIKey(key),
+		option.WithBaseURL(u.Scheme+"://"+u.Host+"/"),
+		option.WithProject(*project),
+		option.WithOrganization(*organization),
+		option.WithMaxRetries(0),
+		option.WithHTTPClient(&http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}),
+		option.WithMiddleware(func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+			endpointURL := *u
+			req.URL = &endpointURL
+			return next(req)
+		}),
+	)
+	request := responses.ResponseNewParams{
+		Model: *model,
+		Input: responses.ResponseNewParamsInputUnion{OfString: openai.String(string(prompt))},
 	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	if *project != "" {
-		req.Header.Set("OpenAI-Project", *project)
+	// SDK JSON options preserve arbitrary parameters and the CLI override rules.
+	opts := []option.RequestOption{option.WithHeader("Accept", "text/event-stream")}
+	for name, value := range params {
+		opts = append(opts, option.WithJSONSet(name, value))
 	}
-	if *organization != "" {
-		req.Header.Set("OpenAI-Organization", *organization)
-	}
-	// Refuse redirects to avoid forwarding credentials to another endpoint.
-	client := &http.Client{Timeout: time.Duration(*timeout), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		if err != nil {
-			return fmt.Errorf("HTTP %s (cannot read error body)", resp.Status)
-		}
-		return fmt.Errorf("HTTP %s: %s", resp.Status, strings.TrimSpace(string(b)))
-	}
-	return stream(resp.Body, stdout)
+	events := service.NewStreaming(ctx, request, opts...)
+	defer events.Close()
+	return stream(events, stdout)
 }
 
-// stream decodes SSE frames, writes text/refusal deltas immediately, and requires
-// a terminal API event. EOF alone is an interrupted prediction, not success.
-func stream(r io.Reader, w io.Writer) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 4096), 16<<20)
-	var data []string
-	dispatch := func() (bool, error) {
-		if len(data) == 0 {
-			return false, nil
-		}
-		payload := strings.Join(data, "\n")
-		data = nil
-		var event struct {
-			Type     string `json:"type"`
-			Delta    string `json:"delta"`
-			Message  string `json:"message"`
-			Response struct {
-				Error *struct {
-					Message string `json:"message"`
-				} `json:"error"`
-				IncompleteDetails *struct {
-					Reason string `json:"reason"`
-				} `json:"incomplete_details"`
-			} `json:"response"`
-		}
-		if err := json.Unmarshal([]byte(payload), &event); err != nil {
-			return false, fmt.Errorf("decode stream event: %w", err)
-		}
+// stream consumes SDK-decoded events and writes text/refusal deltas immediately.
+// EOF alone is an interrupted prediction, not successful completion.
+func stream(events *ssestream.Stream[responses.ResponseStreamEventUnion], w io.Writer) error {
+	for events.Next() {
+		event := events.Current()
 		switch event.Type {
 		case "response.output_text.delta", "response.refusal.delta":
 			if _, err := io.WriteString(w, event.Delta); err != nil {
-				return false, fmt.Errorf("write output: %w", err)
+				return fmt.Errorf("write output: %w", err)
 			}
 		case "response.completed":
-			return true, nil
+			return nil
 		case "response.failed", "response.incomplete", "response.cancelled", "error":
 			detail := event.Message
-			if event.Response.Error != nil {
+			if event.Response.Error.Message != "" {
 				detail = event.Response.Error.Message
 			}
-			if event.Response.IncompleteDetails != nil {
-				detail = event.Response.IncompleteDetails.Reason
+			if event.Response.IncompleteDetails.Reason != "" {
+				detail = string(event.Response.IncompleteDetails.Reason)
 			}
-			return false, fmt.Errorf("%s: %s", event.Type, detail)
-		}
-		return false, nil
-	}
-	// SSE comments and other fields are ignored; multiple data lines form one event.
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			done, err := dispatch()
-			if err != nil || done {
-				return err
-			}
-		} else if strings.HasPrefix(line, "data:") {
-			data = append(data, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+			return fmt.Errorf("%s: %s", event.Type, detail)
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read stream: %w", err)
-	}
-	done, err := dispatch()
-	if err != nil || done {
-		return err
+	if err := events.Err(); err != nil {
+		return fmt.Errorf("stream: %w", err)
 	}
 	return errors.New("stream ended before a terminal response event")
 }
